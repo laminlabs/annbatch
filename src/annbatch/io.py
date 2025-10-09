@@ -14,7 +14,7 @@ from tqdm import tqdm
 from zarr.codecs import BloscCodec, BloscShuffle
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
     from os import PathLike
     from typing import Any, Literal
 
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 def write_sharded(
     group: zarr.Group,
     adata: ad.AnnData,
+    *,
     sparse_chunk_size: int = 32768,
     sparse_shard_size: int = 134_217_728,
     dense_chunk_obs: int = 1024,
@@ -88,6 +89,11 @@ def _lazy_load_with_obs_var_in_memory(paths: Iterable[PathLike[str]] | Iterable[
         adata = ad.experimental.read_lazy(path)
         adata.obs = adata.obs.to_memory()
         adata.var = adata.var.to_memory()
+        if adata.raw is not None:
+            adata_raw = adata.raw.to_adata()
+            del adata.raw
+            adata_raw.var = adata_raw.var.to_memory()
+            adata.raw = adata_raw
         adatas.append(adata)
     if len(adatas) == 1:
         return adatas[0]
@@ -135,6 +141,7 @@ def create_anndata_collection(
     shuffle: bool = True,
     should_denseify: bool = False,
     output_format: Literal["h5ad", "zarr"] = "zarr",
+    transform_input_adata: Callable[[ad.AnnData], ad.AnnData] = lambda x: x,
 ):
     """Take a list of anndata paths, create an on-disk set of anndata datasets (together referred to as a "collection" where each dataset is called `dataset_i.{zarr,h5ad}`) with uniform var spaces at the desired path with `n_obs_per_dataset` rows per store.
 
@@ -173,6 +180,8 @@ def create_anndata_collection(
             Whether or not to write as dense on disk.
         output_format
             Format of the output store. Can be either "zarr" or "h5ad".
+        transform_input_adata
+            Function to allow transforming the concatenated inputs, i.e, dropping `obsm` or bringing an element into memory, before writing to disk.
 
     Examples
     --------
@@ -188,6 +197,7 @@ def create_anndata_collection(
     ad.settings.zarr_write_format = 3
     adata_concat = _lazy_load_with_obs_var_in_memory(adata_paths)
     adata_concat.obs_names_make_unique()
+    adata_concat = transform_input_adata(adata_concat)
     chunks = _create_chunks_for_shuffling(adata_concat, n_obs_per_dataset, shuffle=shuffle)
 
     if var_subset is None:
@@ -197,9 +207,11 @@ def create_anndata_collection(
         var_mask = adata_concat.var_names.isin(var_subset)
         adata_chunk = adata_concat[chunk, :][:, var_mask].copy()
         adata_chunk.X = adata_chunk.X.persist()
-        for k, elem in adata_chunk.obsm.items():
-            if isinstance(elem, DaskArray):
-                adata_chunk.obsm[k] = elem.persist()
+        if adata_chunk.raw is not None:
+            adata_raw = adata_chunk.raw.to_adata()
+            adata_raw.X = adata_raw.X.persist()
+            del adata_chunk.raw
+            adata_chunk.raw = adata_raw
         if shuffle:
             # shuffle adata in memory to break up individual chunks
             idxs = np.random.default_rng().permutation(np.arange(len(adata_chunk)))
