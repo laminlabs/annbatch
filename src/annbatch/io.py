@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import random
+import warnings
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,6 +21,10 @@ if TYPE_CHECKING:
     from typing import Any, Literal
 
     from zarr.abc.codec import BytesBytesCodec
+
+
+def _round_down(num: int, divisor: int):
+    return num - (num % divisor)
 
 
 def write_sharded(
@@ -61,26 +67,61 @@ def write_sharded(
         *,
         iospec: ad.experimental.IOSpec,
     ):
+        # Ensure we're not overriding anything here
+        dataset_kwargs = dataset_kwargs.copy()
         if iospec.encoding_type in {"array"} and (
             any(n in store.name for n in {"obsm", "layers", "obsp"}) or "X" == elem_name
         ):
+            # Get either the desired size or the next multiple down to ensure divisibility of chunks and shards
+            shard_size = min(dense_shard_obs, _round_down(elem.shape[0], dense_chunk_obs))
+            chunk_size = min(dense_chunk_obs, _round_down(elem.shape[0], dense_chunk_obs))
+            # If the shape is less than the computed size (impossible given rounds?) or the rounding caused created a 0-size chunk, then error
+            if elem.shape[0] < chunk_size or chunk_size == 0:
+                raise ValueError(
+                    f"Choose a dense shard obs {dense_shard_obs} and chunk obs {dense_chunk_obs} with non-zero size less than the number of observations {elem.shape[0]}"
+                )
             dataset_kwargs = {
-                "shards": (min(dense_shard_obs, elem.shape[0]),) + (elem.shape[1:]),  # only shard over 1st dim
-                "chunks": (min(dense_chunk_obs, elem.shape[0]),) + (elem.shape[1:]),  # only chunk over 1st dim
-                "compressors": compressors,
                 **dataset_kwargs,
+                "shards": (shard_size,) + elem.shape[1:],  # only shard over 1st dim
+                "chunks": (chunk_size,) + elem.shape[1:],  # only chunk over 1st dim
+                "compressors": compressors,
             }
         elif iospec.encoding_type in {"csr_matrix", "csc_matrix"}:
             dataset_kwargs = {
+                **dataset_kwargs,
                 "shards": (sparse_shard_size,),
                 "chunks": (sparse_chunk_size,),
                 "compressors": compressors,
-                **dataset_kwargs,
             }
         write_func(store, elem_name, elem, dataset_kwargs=dataset_kwargs)
 
     ad.experimental.write_dispatched(group, "/", adata, callback=callback)
     zarr.consolidate_metadata(group.store)
+
+
+def _check_for_mismatched_keys(paths: Iterable[PathLike[str]] | Iterable[str]):
+    num_raw_in_adata = 0
+    found_keys: dict[str, defaultdict[str, int]] = {"layers": defaultdict(lambda: 0), "obsm": defaultdict(lambda: 0)}
+    for path in paths:
+        adata = ad.experimental.read_lazy(path)
+        for elem_name, key_count in found_keys.items():
+            curr_keys = set(getattr(adata, elem_name).keys())
+            for key in curr_keys:
+                key_count[key] += 1
+        if adata.raw is not None:
+            num_raw_in_adata += 1
+    if num_raw_in_adata != len(paths):
+        warnings.warn(
+            f"Found anndata at {path} that has raw and others do not (other paths: {paths}), consider deleting raw via `transform_input_adata`",
+            stacklevel=2,
+        )
+    for elem_name, key_count in found_keys.items():
+        for key, count in key_count.items():
+            if count > 0:
+                warnings.warn(
+                    f"Found anndata at {path} that has {elem_name} key {key} not present in the other paths' {elem_name} (other paths: {paths}), consider stopping and using the `transform_input_adata` argument to alter {elem_name} accordingly.",
+                    stacklevel=2,
+                )
 
 
 def _lazy_load_with_obs_var_in_memory(paths: Iterable[PathLike[str]] | Iterable[str]):
@@ -103,7 +144,6 @@ def _lazy_load_with_obs_var_in_memory(paths: Iterable[PathLike[str]] | Iterable[
 def _read_into_memory(paths: Iterable[PathLike[str]] | Iterable[str]):
     adatas = []
     for path in paths:
-        print(path)
         adata = getattr(ad, f"read_{Path(path).suffix.split('.')[-1]}")(path)
         adatas.append(adata)
 
@@ -195,6 +235,7 @@ def create_anndata_collection(
     """
     Path(output_path).mkdir(parents=True, exist_ok=True)
     ad.settings.zarr_write_format = 3
+    _check_for_mismatched_keys(adata_paths)
     adata_concat = _lazy_load_with_obs_var_in_memory(adata_paths)
     adata_concat.obs_names_make_unique()
     adata_concat = transform_input_adata(adata_concat)
@@ -212,6 +253,10 @@ def create_anndata_collection(
             adata_raw.X = adata_raw.X.persist()
             del adata_chunk.raw
             adata_chunk.raw = adata_raw
+        for dict_elem in [adata_chunk.obsm, adata_chunk.layers]:
+            for k, elem in dict_elem.items():
+                if isinstance(elem, DaskArray):
+                    dict_elem[k] = elem.persist()
         if shuffle:
             # shuffle adata in memory to break up individual chunks
             idxs = np.random.default_rng().permutation(np.arange(len(adata_chunk)))
@@ -300,6 +345,7 @@ def add_to_collection(
     encoding = _get_array_encoding_type(output_path)
     if encoding == "array":
         print("Detected array encoding type. Will convert to dense format before writing.")
+    _check_for_mismatched_keys(list(adata_paths) + shards)
 
     if read_full_anndatas:
         adata_concat = _read_into_memory(adata_paths)
